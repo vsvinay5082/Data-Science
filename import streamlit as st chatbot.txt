@@ -1,0 +1,737 @@
+import streamlit as st
+
+from pathlib import Path
+
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+
+from langchain.agents.agent_types import AgentType
+
+from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
+
+from sqlalchemy import create_engine
+
+import sqlite3
+
+import boto3
+
+import os
+
+import traceback
+
+import pandas as pd
+
+import numpy as np
+
+import importlib
+
+from typing import Optional
+
+from botocore.config import Config
+
+from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+from langchain_core.prompts.loading import load_prompt
+
+from importlib import resources
+
+from datetime import datetime
+
+import json
+
+from langchain_aws import ChatBedrock
+
+from langchain_aws import BedrockLLM
+
+from botocore.exceptions import ClientError
+ 
+from langchain_experimental.sql import SQLDatabaseChain
+
+from dotenv import load_dotenv
+
+from langchain_community.utilities import SQLDatabase
+
+from langchain.prompts.prompt import PromptTemplate
+ 
+from langchain_experimental.utilities import PythonREPL
+
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+ 
+from langchain.agents import ZeroShotAgent, Tool, AgentExecutor
+
+from langchain.memory import ConversationBufferMemory
+
+from langchain.chains import LLMChain
+
+from urllib.parse import quote_plus
+ 
+from langchain.schema.runnable import RunnableConfig
+ 
+## Database Schema Overview
+ 
+### Core Tables
+
+- **IM_DEMOGRAPHICS**: Patient demographics including disease_indication (disease indication)
+
+- **IM_EXPOSURE**: Treatment exposure data with TRTNM_STANDARDIZED (standardized treatment name)
+
+- **IM_ADVERSE_EVENTS**: Adverse event records
+
+- **IM_ENDPOINTS_[TYPE]**: Disease-specific endpoint data (SLEDAI, SLICC, BILAG, etc.)
+
+- **IM_LAB_BIOMARKERS**: Laboratory biomarker data
+ 
+### Key Fields
+
+- `usubjid`: Unique patient identifier (use for patient counting)
+
+- `studyid_conf`: Study identifier
+
+- `disease_indication`: Disease indication
+
+- `TRTNM_STANDARDIZED`: Standardized treatment name
+ 
+## Query Generation Rules
+ 
+### 1. Patient Counting Queries
+
+- **ALWAYS use** `COUNT(DISTINCT usubjid)` for patient counts
+
+- **For grouped queries** use `GROUP BY` with patient counts
+ 
+Example:
+
+```sql
+
+-- Patient count per disease indication
+
+SELECT COUNT(DISTINCT usubjid) as patient_count, disease_indication 
+
+FROM IM_DEMOGRAPHICS 
+
+GROUP BY disease_indication;
+
+```
+ 
+### 2. Treatment-Related Queries
+
+- Filter out: `TRTNM_STANDARDIZED IS NULL` and `TRTNM_STANDARDIZED = 'PLACEBO'`
+
+- For disease information, JOIN with IM_DEMOGRAPHICS table
+ 
+Example:
+
+```sql
+
+-- Treated patients per disease
+
+SELECT COUNT(DISTINCT a.usubjid) as patient_count, b.disease_indication
+
+FROM IM_EXPOSURE a, IM_DEMOGRAPHICS b
+
+WHERE a.studyid_conf = b.studyid_conf 
+
+  AND a.usubjid = b.usubjid
+
+  AND (a.TRTNM_STANDARDIZED IS NOT NULL AND a.TRTNM_STANDARDIZED != 'PLACEBO')
+
+GROUP BY b.disease_indication;
+
+```
+ 
+### 3. Disease-Specific Queries
+
+- Lupus diseases: `disease_indication LIKE '%lupus%'`
+
+- Rheumatoid Arthritis: `disease_indication = 'Rheumatoid Arthritis'`
+
+- IBD: Look for UC (Ulcerative Colitis) and Crohn's related conditions
+ 
+### 4. Table Join Principles
+
+- Cross-table queries MUST join on `studyid_conf` AND `usubjid`
+
+- Use primary clinical tables, avoid unnecessary complex joins
+ 
+## Query Reasoning Framework
+ 
+Before generating queries, think through these steps:
+ 
+1. **Identify Query Type**:
+
+   - Patient counting? Treatment analysis? Endpoint data?
+
+2. **Determine Main Tables**:
+
+   - Need disease info → IM_DEMOGRAPHICS
+
+   - Need treatment info → IM_EXPOSURE  
+
+   - Need endpoint data → IM_ENDPOINTS_*
+ 
+3. **Determine Filter Conditions**:
+
+   - Exclude placebo and null treatments
+
+   - Specific disease indications
+
+   - Time range constraints
+ 
+4. **Determine Output Format**:
+
+   - Summary statistics → COUNT/GROUP BY
+
+   - Detailed lists → SELECT specific fields
+
+   - Sorting needs → ORDER BY
+ 
+## Common Query Patterns
+ 
+### Pattern 1: Disease Patient Distribution
+
+```sql
+
+SELECT COUNT(DISTINCT usubjid) as patient_count, disease_indication
+
+FROM IM_DEMOGRAPHICS 
+
+WHERE disease_indication IS NOT NULL
+
+GROUP BY disease_indication
+
+ORDER BY patient_count DESC;
+
+```
+ 
+### Pattern 2: Treatment Drug Analysis
+
+```sql
+
+SELECT COUNT(DISTINCT a.usubjid) as patient_count, a.TRTNM_STANDARDIZED
+
+FROM IM_EXPOSURE a, IM_DEMOGRAPHICS b
+
+WHERE a.studyid_conf = b.studyid_conf 
+
+  AND a.usubjid = b.usubjid
+
+  AND a.TRTNM_STANDARDIZED IS NOT NULL 
+
+  AND a.TRTNM_STANDARDIZED != 'PLACEBO'
+
+  AND b.disease_indication LIKE '%lupus%'
+
+GROUP BY a.TRTNM_STANDARDIZED
+
+ORDER BY patient_count DESC;
+
+```
+ 
+### Pattern 3: Adverse Event Statistics
+
+```sql
+
+SELECT COUNT(DISTINCT a.usubjid) as patient_count, 
+
+       a.TRTNM_STANDARDIZED,
+
+       COUNT(*) as ae_count
+
+FROM IM_EXPOSURE a, IM_ADVERSE_EVENTS b
+
+WHERE a.studyid_conf = b.studyid_conf 
+
+  AND a.usubjid = b.usubjid
+
+  AND a.TRTNM_STANDARDIZED IS NOT NULL 
+
+  AND a.TRTNM_STANDARDIZED != 'PLACEBO'
+
+GROUP BY a.TRTNM_STANDARDIZED
+
+ORDER BY ae_count DESC;
+
+```
+ 
+## Output Requirements
+ 
+1. **Output SQL query only**, no additional explanations in casual conversation
+
+2. **Ensure syntax correctness**, use standard MySQL syntax  
+
+3. **Optimize performance**, avoid unnecessary table scans
+
+4. **Include appropriate comments** when needed
+ 
+## Error Prevention
+ 
+❌ Do NOT use `SELECT *` from large tables
+
+❌ Do NOT forget to filter PLACEBO and NULL treatments
+
+❌ Do NOT use incorrect table join conditions
+
+❌ Do NOT ignore patient deduplication (DISTINCT usubjid)
+ 
+## Known Business Context
+ 
+### Disease Indications in Database:
+
+- Rheumatoid Arthritis (largest population: ~17,317 patients)
+
+- Lupus Erythematosus, Lupus Nephritis, Systemic Lupus Erythematosus
+
+- Ulcerative Colitis, Crohn's Disease
+
+- Psoriasis, Psoriatic Arthritis
+
+- Multiple other autoimmune conditions
+ 
+### Common BMS Treatments:
+
+- ABATACEPT (most common for lupus: ~626 patients)
+
+- LULIZUMAB, DEUCRAVACITINIB, IBERDOMIDE
+
+- Various other investigational compounds
+ 
+### Endpoint Types Available:
+
+- SLEDAI: Lupus disease activity
+
+- SLICC: Lupus damage assessment  
+
+- BILAG: British Isles Lupus Assessment
+
+- SRI: SLE Responder Index
+
+- BICLA: BILAG-based Composite Lupus Assessment
+
+- Joint Counts: For arthritis assessments
+
+- Fatigue assessments
+
+- Lab Biomarkers
+ 
+When you have to interact with a SQL database, given an input question, create a syntactically correct MySQL query, 
+
+then run the query using provided tools, and then look at the results of the run query, and return your final answer.
+ 
+You should trust the response you get after running the SQL query.
+ 
+DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+ 
+If the question does not seem related to the database, just return "I do not know" as the final answer.
+
+Unless the user specifies a specific number of examples they wish to obtain, always limit your query to at most 5 results.
+
+Never query for all the columns from a specific table, only ask for the relevant columns given the question.
+ 
+You have access to tools for interacting with the database. Only use the provided tools. Only use the information returned by the provided
+
+tools to construct your final answer.
+ 
+If the answer requires some visualization use matplotlib or seaborn library with python on the results obtained from SQL Query.
+ 
+When you have a response to say to the Human, or if you do not need to use a tool, you MUST use the format:
+
+```
+
+Thought: Do I need to use a tool? No
+
+Final Answer: [your response here]
+
+```
+
+"""
+ 
+st.set_page_config(page_title="LangChain: Chat with SCD DB", page_icon="🦜", layout="wide")
+
+st.markdown("""
+<style>
+
+               .block-container {
+
+                    padding-top: 1.1rem;
+
+                    padding-bottom: 1rem;
+
+                }
+
+                .row_heading.level0 {display:none}
+
+                .blank {display:none}
+</style>
+
+        """, unsafe_allow_html=True)
+
+st.title("🦜 LangChain: chat with SCD DB")
+
+ 
+INJECTION_WARNING = """
+
+                    SQL agent can be vulnerable to prompt injection. Use a DB role with limited permissions.
+
+                    Read more [here](https://python.langchain.com/docs/security).
+
+               """
+ 
+if 'dbConnectStatus' not in st.session_state:
+
+    st.session_state.dbConnectStatus = False
+
+if 'agent_chain' not in st.session_state:
+
+    st.session_state.agent_chain = None
+ 
+if 'db' not in st.session_state:
+
+    st.session_state.db = None
+ 
+if "scd_history" not in st.session_state:
+
+    st.session_state["scd_history"] = []
+ 
+if "steps" not in st.session_state:
+
+    st.session_state["steps"] = {}
+ 
+msgs = StreamlitChatMessageHistory(key="scd_history")
+ 
+@st.cache_resource(ttl="2h")
+
+def connect_db(mysql_user, mysql_password, mysql_host, mysql_database):
+
+    if st.session_state.db:
+
+        return st.session_state.db
+
+    load_dotenv()
+
+    try:
+
+        mysql_password = quote_plus(mysql_password)
+
+        db = SQLDatabase.from_uri(f"mysql+pymysql://{mysql_user}:{mysql_password}@{mysql_host}/{mysql_database}")
+
+        print(f"Successfully connected to the database. Host: {mysql_host}")
+
+        return db
+
+    except Exception as e:
+
+        print(f"Error connecting to the database: {e}")
+
+        return None
+ 
+def create_llm(max_tokens=4096, temperature=0.0, max_retries=10, modelId=None, credentials=None):
+
+    if not modelId:
+
+        modelId = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+    config = Config(
+
+        retries={"max_attempts": 3, "mode": "standard"},
+
+        connect_timeout=5,
+
+        read_timeout=60,
+
+        max_pool_connections=50,
+
+    )
+
+    session = boto3.Session(
+
+        aws_access_key_id=credentials['AccessKeyId'] if credentials else None,
+
+        aws_secret_access_key=credentials['SecretAccessKey'] if credentials else None,
+
+        aws_session_token=credentials['SessionToken'] if credentials else None,
+
+        region_name="us-east-1"
+
+    )
+
+    bedrock_client = boto3.client(service_name='bedrock-runtime', config=config, region_name="us-east-1")
+
+    model_kwargs = {"max_tokens": max_tokens, "temperature": temperature}
+
+    common_params = {
+
+        "model_id": modelId,
+
+        "client": bedrock_client,
+
+        "model_kwargs": model_kwargs,
+
+        "verbose": True,
+
+    }
+
+    llm = ChatBedrock(**common_params, streaming=True)
+
+    return llm
+ 
+def create_tools(db, llm):
+
+    sql_toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+ 
+    repl_tool = Tool(
+
+        name="python_repl",
+
+        description="A Python shell. Use this to execute python commands. \
+
+    Input should be a valid python command. If you want to see the output of a value, you should print it out with `print(...)`.",
+
+        func=PythonREPL().run,
+
+    )
+ 
+    tools = sql_toolkit.get_tools()
+
+    tools.append(repl_tool)
+ 
+    return sql_toolkit, tools
+ 
+def create_enhanced_prompt(tools, sql_toolkit):
+
+    """Create enhanced prompt with SCD-specific instructions"""
+
+    format_instructions = """Use the following format:
+
+                             Question: the input question you must answer
+
+                             Thought: you should always think about what to do
+
+                             Action: the action to take, should be one of [{tool_names}]
+
+                             Action Input: the input to the action
+
+                             Observation: the result of the action ... (thisThought/Action/Action Input/Observation can repeat 3 times)
+
+                             Thought: I now know the final answer
+
+                             Final Answer: the final answer to the original input question
+
+                             """
+ 
+    suffix = """Begin!
+
+    You are an AI talking to a human. Here is the chat history so far:
+ 
+    {chat_history}
+ 
+    New Question: {human_input}
+ 
+    {agent_scratchpad}
+ 
+    Let's think step by step and do not rush to conclusions:
+
+    """
+ 
+    prompt = ZeroShotAgent.create_prompt(
+
+        tools=tools,
+
+        prefix=ENHANCED_SYSTEM_PROMPT.format(dialect=sql_toolkit.dialect, top_k=5),
+
+        suffix=suffix,
+
+        input_variables=["human_input", "chat_history", "agent_scratchpad"],
+
+        format_instructions=format_instructions,
+
+    )
+
+    return prompt
+ 
+def agent(llm, prompt, tools, verbose=True):
+
+    memory = ConversationBufferMemory(memory_key="chat_history", input_key="human_input")
+
+    llm_chain = LLMChain(llm=llm, prompt=prompt)
+
+    agent = ZeroShotAgent(llm_chain=llm_chain, tools=tools, handle_parsing_errors=True)
+ 
+    agent_chain = AgentExecutor.from_agent_and_tools(
+
+        agent=agent,
+
+        tools=tools,
+
+        verbose=verbose,
+
+        memory=memory,
+
+        handle_parsing_errors=True,
+
+        return_intermediate_steps=True,
+
+        max_iterations=100,
+
+    )
+
+    return agent_chain
+ 
+llm = create_llm()
+ 
+with st.sidebar:
+
+    tab = st.tabs(["Database Connection Profile"])
+
+    tab = tab[0]
+
+    hostName_options = ["bms-tahoe-rds-r4-prod.web.bms.com"]
+
+    hostName = tab.selectbox(
+
+                "Host Name",
+
+                hostName_options,
+
+                index=None,
+
+                placeholder="Select Host...",
+
+            )
+
+    if hostName:
+
+        if hostName_options.index(hostName) == 0:
+
+            database = tab.selectbox('Select Database', ["im_conf", "cn_conf", "io_conf"], index=None, placeholder="Select DB...")
+
+    else:
+
+        database = tab.selectbox('Select Database', [], index=None, placeholder="Select DB...")
+
+    if database:
+
+        UserName = tab.text_input("Database User Name ")
+
+        passWord = tab.text_input("Database Password ", type="password")
+
+    else:
+
+        UserName = tab.text_input("Database User Name ", disabled=True,)
+
+        passWord = tab.text_input("Database Password ", disabled=True, type="password")
+ 
+    st.divider()
+
+    if not st.session_state.dbConnectStatus:
+
+        dbConnectStatus = st.button('Connect to DB')
+
+        st.session_state.dbConnectStatus = dbConnectStatus
+
+    if st.session_state.dbConnectStatus:
+
+        st.session_state.db = connect_db(UserName, passWord, hostName, database)
+
+        if st.session_state.get("db"):
+
+            st.write("DB Connection Successful")
+
+            toolkit = SQLDatabaseToolkit(db=st.session_state.get("db"), llm=llm)
+
+        else:
+
+            st.warning("Invalid Database Details !!", icon="⚠️")
+
+            st.stop()
+
+    else:
+
+        st.info("Please enter Database Details and Connect to DB!!")
+
+        st.stop()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        if st.button("Clear Chat"):
+
+            msgs.clear()
+
+            for key in list(st.session_state.keys()):
+
+                if key != "scd_history":
+
+                    del st.session_state[key]
+
+            st.rerun()
+ 
+if not st.session_state.agent_chain:
+
+    llm = create_llm()
+
+    sql_toolkit, tools = create_tools(st.session_state.get("db"), llm)
+
+    prompt = create_enhanced_prompt(tools, sql_toolkit)
+
+    st.session_state.agent_chain = agent(llm, prompt, tools,)
+ 
+if len(msgs.messages) == 0:    
+
+    msgs.add_ai_message("Hi! I'm your SCD database assistant. I can help you query clinical trial data for immunology studies. What would you like to know?")
+
+    st.session_state.steps = {}
+
+chain_with_history = RunnableWithMessageHistory(
+
+    st.session_state.agent_chain,
+
+    lambda session_id: msgs,
+
+    input_messages_key="human_input",
+
+    history_messages_key="chat_history",
+
+)
+ 
+avatars = {"human": "user", "ai": "assistant"}
+
+for idx, msg in enumerate(msgs.messages):
+
+    with st.chat_message(avatars[msg.type]):
+
+        for step in st.session_state.steps.get(str(idx), []):
+
+            if step[0].tool == "_Exception":
+
+                continue
+
+            with st.status(f"**{step[0].tool}**: {step[0].tool_input}", state="complete"):
+
+                st.write(step[0].log)
+
+                st.write(step[1])
+
+        st.write(msg.content)
+ 
+if prompt := st.chat_input(placeholder="Ask me about SCD data! e.g., 'How many patients do we have per disease indication?'"):
+
+    st.chat_message("human").write(prompt)
+
+    with st.chat_message("ai"):
+
+        st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
+
+        cfg = RunnableConfig()
+
+        cfg["callbacks"] = [st_cb]
+
+        cfg["session_id"] = "any"
+ 
+        response = chain_with_history.invoke({"human_input": prompt}, cfg)
+ 
+        st.write(response["output"])
+
+        st.session_state.steps[str(len(msgs.messages) - 1)] = response["intermediate_steps"]
+ 
